@@ -41,10 +41,11 @@ from utilities.storage import load_graph_collection, save_graph_item, save_named
 
 
 DEFAULT_AGENT_URI = AGENTS.AgenteComerciante
-_LOT_DISPATCH_INTERVAL = float(os.environ.get("LOT_DISPATCH_INTERVAL", "3"))
+_LOT_DISPATCH_INTERVAL = float(os.environ.get("LOT_DISPATCH_INTERVAL", "10"))
+_LOT_URGENT_DEBOUNCE = float(os.environ.get("LOT_URGENT_DEBOUNCE", "5"))
 _CL_TRANSPORT_TIMEOUT = float(os.environ.get("CL_TRANSPORT_TIMEOUT", "4"))
-# Debe cubrir: ciclo de lote pendiente + CFP paralela a transportistas.
-_DEFAULT_SHIPPING_WAIT = _LOT_DISPATCH_INTERVAL + _CL_TRANSPORT_TIMEOUT * 2 + 4
+# Debe cubrir: sondeo CL + CFP paralela (el despacho tras pedido ignora debounce de agrupación).
+_DEFAULT_SHIPPING_WAIT = _LOT_URGENT_DEBOUNCE + _CL_TRANSPORT_TIMEOUT * 2 + 6
 DEFAULT_SHIPPING_CONFIRMATION_TIMEOUT = float(
     os.environ.get("SHIPPING_CONFIRMATION_TIMEOUT", str(max(15.0, _DEFAULT_SHIPPING_WAIT)))
 )
@@ -906,11 +907,14 @@ def main():
     address = agent_address(advertised_host, args.port)
     service_id = agent_id("AGENTE_COMERCIANTE", advertised_host, args.port)
 
-    logistics_fallback: list[str] = []
+    default_logistics = [
+        "http://127.0.0.1:9002/comm",
+        "http://127.0.0.1:9012/comm",
+    ]
     if args.logistics_url:
         logistics_fallback = [_comm_url(u) for u in args.logistics_url]
-    elif not args.dir:
-        logistics_fallback = ["http://127.0.0.1:9002/comm"]
+    else:
+        logistics_fallback = [_comm_url(u) for u in default_logistics]
 
     financiero_base = args.financiero_url or search_service(args.dir, "AGENTE_FINANCIERO", service_id) or "http://127.0.0.1:9005"
     financiero_url = _comm_url(financiero_base)

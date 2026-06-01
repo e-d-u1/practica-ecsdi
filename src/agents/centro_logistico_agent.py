@@ -26,6 +26,8 @@ from utilities.pending_lotes import (
     list_pending_lote_ids,
     load_pending_meta,
     mark_lote_in_transit,
+    release_lote_from_transit,
+    reserved_quantities_for_center,
     select_lotes_for_dispatch,
 )
 from utilities.runtime import (
@@ -39,7 +41,6 @@ from utilities.runtime import (
     search_service,
     unregister_service,
 )
-from utilities.storage import load_json, save_json
 from utilities.transport_proto import (
     find_transport_offer,
     offer_is_accepted,
@@ -63,7 +64,7 @@ DEFAULT_TRANSPORT_TIMEOUT = float(os.environ.get("CL_TRANSPORT_TIMEOUT", "4"))
 
 # Plan DecidirLotesAEntregar: intervalo de sondeo CiertaHoraDia (segundos en demo).
 DEFAULT_LOT_DISPATCH_INTERVAL = float(os.environ.get("LOT_DISPATCH_INTERVAL", "10"))
-DEFAULT_LOT_DEBOUNCE_SECONDS = float(os.environ.get("LOT_DEBOUNCE_SECONDS", "90"))
+DEFAULT_LOT_DEBOUNCE_SECONDS = float(os.environ.get("LOT_DEBOUNCE_SECONDS", "30"))
 DEFAULT_LOT_URGENT_DEBOUNCE_SECONDS = float(os.environ.get("LOT_URGENT_DEBOUNCE", "5"))
 DEFAULT_LOT_MAX_LINES = int(os.environ.get("LOT_MAX_LINES", "8"))
 
@@ -93,7 +94,6 @@ def create_app(
 
     app = Flask(__name__)
     center = center_uri(center_id)
-    stock_reservations = load_json("stock_reservations.json", {})
     stock_set = {p.strip() for p in stock_products if p.strip()}
     accepts_all = stock_set == {"*"} or not stock_set
     log_tag = f"logistico-{center_id}"
@@ -125,7 +125,7 @@ def create_app(
 
     dispatch_lock = Lock()
 
-    def _run_dispatch_cycle() -> None:
+    def _run_dispatch_cycle(*, ignore_debounce: bool = False) -> None:
         """Plan SeleccionarLotesAEntregar + NegociarConTransportistas (CiertaHoraDia)."""
 
         with dispatch_lock:
@@ -133,6 +133,7 @@ def create_app(
                 center_id,
                 debounce_seconds=lot_debounce_seconds,
                 urgent_debounce_seconds=lot_urgent_debounce_seconds,
+                ignore_debounce=ignore_debounce,
             )
             if not selected:
                 return
@@ -148,14 +149,13 @@ def create_app(
                 )
                 if best_offer is None:
                     log(log_tag, f"Lote {lote_id}: sin ofertas de transporte")
+                    release_lote_from_transit(center_id, lote_id)
                     continue
                 _close_contract_net(
                     agent_uri, lote, lote_graph, best_offer, best_transportista, all_offers, log_tag
                 )
                 set_offer_accepted(best_offer_graph, best_offer, True)
                 _merge_graphs(best_offer_graph, lote_graph)
-                _reserve_stock_from_lote(stock_reservations, lote_graph, lote, center, product_quantities)
-                save_json("stock_reservations.json", stock_reservations)
                 decrement_catalog_stock(center_id, product_quantities)
                 _notify_comerciantes_dispatch(
                     center_id,
@@ -203,7 +203,7 @@ def create_app(
                 center_id,
                 accepts_all,
                 stock_set,
-                stock_reservations,
+                reserved_quantities_for_center(center_id),
             )
             if not fulfillable_lines:
                 log(log_tag, "Sin lineas servibles para este centro; respondiendo failure controlado")
@@ -267,10 +267,10 @@ def create_app(
                 fulfillable_lines,
             )
             if lot_dispatch_interval <= 0:
-                _run_dispatch_cycle()
+                _run_dispatch_cycle(ignore_debounce=True)
             else:
-                # No esperar al scheduler: despachar en segundo plano tras agrupar el lote.
-                Thread(target=_run_dispatch_cycle, daemon=True).start()
+                # Tras un pedido nuevo: negociar transporte ya (sin esperar debounce de agrupación).
+                Thread(target=_run_dispatch_cycle, kwargs={"ignore_debounce": True}, daemon=True).start()
             return reply(response)
         except Exception as exc:
             return rdf_response(build_failure(agent_uri, AGENTS.AsistenteVirtual, None, str(exc)), status=500)
@@ -303,7 +303,7 @@ def _filter_lines_by_stock(
     center_id: str,
     accepts_all: bool,
     stock_set: set[str],
-    reservations: dict,
+    reserved_by_product: dict[str, int],
 ) -> list[URIRef]:
     """Devuelve sólo las líneas que este centro logístico puede servir."""
 
@@ -324,7 +324,7 @@ def _filter_lines_by_stock(
             fulfillable.append(line)
             continue
 
-        reserved = int(reservations.get(center_id, {}).get(product_id, 0))
+        reserved = int(reserved_by_product.get(product_id, 0))
         if available - reserved >= requested:
             fulfillable.append(line)
     return fulfillable
@@ -388,21 +388,6 @@ def _product_quantities_from_lote(lote_graph: Graph, lote: URIRef) -> dict[str, 
         quantity = int(next(lote_graph.objects(line, ECSDI.cantidad), 1))
         quantities[product_id] = quantities.get(product_id, 0) + quantity
     return quantities
-
-
-def _reserve_stock_from_lote(
-    reservations: dict,
-    lote_graph: Graph,
-    lote: URIRef,
-    center: URIRef,
-    product_quantities: dict[str, int],
-) -> None:
-    center_id = str(next(lote_graph.objects(center, ECSDI.idCentroLogistico), ""))
-    if not center_id:
-        center_id = str(center).rsplit("/", 1)[-1]
-    center_reservations = reservations.setdefault(center_id, {})
-    for product_id, quantity in product_quantities.items():
-        center_reservations[product_id] = int(center_reservations.get(product_id, 0)) + quantity
 
 
 def _notify_comerciantes_dispatch(

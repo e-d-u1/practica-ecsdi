@@ -20,7 +20,7 @@ PENDING_ROOT = DATA_DIR / "pending_lotes"
 ESTADO_PENDIENTE_ENVIO = "pendiente_envio"
 ESTADO_EN_TRANSITO = "en_negociacion_transporte"
 DIST_ZONE_SIZE = int(os.environ.get("LOT_DIST_ZONE_SIZE", "200"))
-DEFAULT_LOT_DEBOUNCE_SECONDS = float(os.environ.get("LOT_DEBOUNCE_SECONDS", "90"))
+DEFAULT_LOT_DEBOUNCE_SECONDS = float(os.environ.get("LOT_DEBOUNCE_SECONDS", "30"))
 DEFAULT_LOT_URGENT_DEBOUNCE_SECONDS = float(os.environ.get("LOT_URGENT_DEBOUNCE", "5"))
 
 
@@ -347,6 +347,34 @@ def _append_lines_to_lote(
     _recalculate_lote_weight(graph, lote)
 
 
+def reserved_quantities_for_center(center_id: str) -> dict[str, int]:
+    """Unidades reservadas por lotes aún no despachados (pendiente o en negociación).
+
+    Sustituye el fichero ``stock_reservations.json``, que podía quedar desincronizado
+    respecto al catálogo tras reinicios o despachos fallidos.
+    """
+
+    totals: dict[str, int] = {}
+    for lote_id in list_pending_lote_ids(center_id):
+        meta = load_pending_meta(center_id, lote_id)
+        if meta.get("estado") not in (ESTADO_PENDIENTE_ENVIO, ESTADO_EN_TRANSITO):
+            continue
+        loaded = load_pending_lote(center_id, lote_id)
+        if loaded is None:
+            continue
+        graph, lote = loaded
+        for line in graph.objects(lote, ECSDI.loteTieneLinea):
+            product = next(graph.objects(line, ECSDI.lineaDeProducto), None)
+            if product is None:
+                continue
+            product_id = str(next(graph.objects(product, ECSDI.idProducto), ""))
+            if not product_id:
+                product_id = str(product).rsplit("/", 1)[-1]
+            quantity = int(next(graph.objects(line, ECSDI.cantidad), 1))
+            totals[product_id] = totals.get(product_id, 0) + quantity
+    return totals
+
+
 def _lote_idle_seconds(meta: dict, now: float | None = None) -> float:
     reference = now if now is not None else time.time()
     last = float(meta.get("last_activity_at", 0))
@@ -393,8 +421,15 @@ def select_lotes_for_dispatch(
     debounce_seconds: float = DEFAULT_LOT_DEBOUNCE_SECONDS,
     urgent_debounce_seconds: float = DEFAULT_LOT_URGENT_DEBOUNCE_SECONDS,
     now: float | None = None,
+    *,
+    ignore_debounce: bool = False,
 ) -> list[tuple[str, Graph, URIRef]]:
-    """Plan SeleccionarLotesAEntregar: lotes inactivos listos, ordenados por urgencia."""
+    """Plan SeleccionarLotesAEntregar: lotes inactivos listos, ordenados por urgencia.
+
+    Con ``ignore_debounce=True`` (p. ej. tras un AvisarCL) se despachan lotes
+    pendientes sin esperar la ventana de inactividad — necesario para que el
+    comerciante reciba ConfirmacionEnvio dentro de su timeout.
+    """
 
     reference = now if now is not None else time.time()
     candidates: list[tuple[int, float, str, Graph, URIRef]] = []
@@ -407,13 +442,32 @@ def select_lotes_for_dispatch(
             continue
         graph, lote = loaded
         priority = int(meta.get("prioridad", lote_priority(graph, lote)))
-        idle = _lote_idle_seconds(meta, reference)
-        threshold = _lote_debounce_threshold(priority, debounce_seconds, urgent_debounce_seconds)
-        if idle < threshold:
-            continue
+        if not ignore_debounce:
+            idle = _lote_idle_seconds(meta, reference)
+            threshold = _lote_debounce_threshold(priority, debounce_seconds, urgent_debounce_seconds)
+            if idle < threshold:
+                continue
         candidates.append((priority, float(meta.get("last_activity_at", 0)), lote_id, graph, lote))
     candidates.sort(key=lambda item: (item[0], item[1]))
     return [(lote_id, graph, lote) for _, _, lote_id, graph, lote in candidates]
+
+
+def release_lote_from_transit(center_id: str, lote_id: str) -> None:
+    """Vuelve a pendiente_envio si la negociación con transportistas falla."""
+
+    meta = load_pending_meta(center_id, lote_id)
+    if meta.get("estado") != ESTADO_EN_TRANSITO:
+        return
+    meta["estado"] = ESTADO_PENDIENTE_ENVIO
+    save_pending_meta(center_id, lote_id, meta)
+    loaded = load_pending_lote(center_id, lote_id)
+    if loaded is None:
+        return
+    graph, lote = loaded
+    for _, pred, obj in list(graph.triples((lote, ECSDI.estadoLote, None))):
+        graph.remove((lote, pred, obj))
+    graph.add((lote, ECSDI.estadoLote, Literal(ESTADO_PENDIENTE_ENVIO)))
+    save_pending_lote(center_id, lote_id, graph)
 
 
 def mark_lote_in_transit(center_id: str, lote_id: str) -> None:

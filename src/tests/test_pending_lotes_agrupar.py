@@ -25,6 +25,7 @@ from utilities.pending_lotes import (
     load_pending_lote,
     load_pending_meta,
     save_pending_meta,
+    reserved_quantities_for_center,
     select_lotes_for_dispatch,
 )
 from utilities.storage import DATA_DIR
@@ -154,6 +155,24 @@ class PendingLotesAgruparTests(unittest.TestCase):
         meta["last_activity_at"] = time.time() - 100
         save_pending_meta(self.center_id, lote_id, meta)
         self.assertEqual(len(select_lotes_for_dispatch(self.center_id, debounce_seconds=90)), 1)
+
+    def test_reserved_quantities_sum_pending_lines(self):
+        g1, p1, lines1, a1 = self._order("PED-RES", "Carrer Set 7", priority=2)
+        create_pending_lote(
+            g1, p1, lines1, center_uri(self.center_id), self.center_id, "Barcelona",
+            "http://127.0.0.1:9001/comm", a1, "http://comerciante",
+        )
+        reserved = reserved_quantities_for_center(self.center_id)
+        self.assertEqual(reserved.get("P-IPHONE19"), 1)
+
+    def test_ignore_debounce_selects_fresh_lote(self):
+        g1, p1, lines1, a1 = self._order("PED-NOW", "Carrer Sis 6", priority=3)
+        create_pending_lote(
+            g1, p1, lines1, center_uri(self.center_id), self.center_id, "Barcelona",
+            "http://127.0.0.1:9001/comm", a1, "http://comerciante",
+        )
+        self.assertEqual(select_lotes_for_dispatch(self.center_id, debounce_seconds=90), [])
+        self.assertEqual(len(select_lotes_for_dispatch(self.center_id, debounce_seconds=90, ignore_debounce=True)), 1)
 
     def test_urgent_lote_dispatches_with_shorter_debounce(self):
         g1, p1, lines1, a1 = self._order("PED-URGENT", "Carrer Cinc 5", priority=1)
